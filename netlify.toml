@@ -1,8 +1,12 @@
 [build]
+  # O app está dentro de "frontend"
+  base    = "frontend"
+  # Usa Yarn e seu script "build": "craco build"
   command = "yarn build"
-  publish = "build"   # troque para "dist" SE seu build gerar "dist"
+  # Saída do Create React App/CRACO é "build"
+  publish = "build"
 
 [[redirects]]
   from = "/*"
-  to = "/index.html"
+  to   = "/index.html"
   status = 200
