@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { Routes, Route, useNavigate } from "react-router-dom";
+import { Routes, Route, useNavigate, Link } from "react-router-dom";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Input } from "../components/ui/input";
@@ -7,6 +7,8 @@ import { Progress } from "../components/ui/progress";
 import { RadioGroup, RadioGroupItem } from "../components/ui/radio-group";
 import { Label } from "../components/ui/label";
 import { useToast } from "../hooks/use-toast";
+import { Checkbox } from "../components/ui/checkbox";
+import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "../components/ui/accordion";
 import {
   BRAND,
   QUESTIONS,
@@ -15,10 +17,11 @@ import {
   saveProfile,
   loadProfile,
   computeScore,
-  saveResult,
   mockEmailOptIn,
   makeResultPayload,
 } from "../mock/mock";
+import { addTest, listAllTests, listTestsByEmail, Enums } from "../lib/db";
+import { exportCSV, exportPDF } from "../lib/exporters";
 
 const Container = ({ children }) => (
   <div className="min-h-screen bg-[hsl(var(--background))]">
@@ -33,9 +36,10 @@ const Header = () => (
     <div className="mx-auto flex w-full max-w-6xl items-center justify-between px-4 py-3">
       <div className="flex items-center gap-3">
         <img src={BRAND.logoUrl} alt="Logo" className="h-8 w-8 object-contain" />
-        <span className="font-extrabold tracking-tight text-[#1D3557]">{BRAND.name}</span>
+        <Link to="/" className="font-extrabold tracking-tight text-[#1D3557]">{BRAND.name}</Link>
       </div>
       <div className="flex items-center gap-3">
+        <Link to="/meus-resultados" className="text-sm text-slate-700 hover:underline">Meus Resultados</Link>
         <a href={BRAND.courseUrl} target="_blank" rel="noreferrer">
           <Button className="bg-[#FFD60A] text-black hover:bg-[#e6c009]">Conhecer o Curso</Button>
         </a>
@@ -48,8 +52,7 @@ const Footer = () => (
   <footer className="border-t bg-[#F1F1F1]">
     <div className="mx-auto w-full max-w-6xl px-4 py-6 text-xs text-slate-600">
       <p>
-        Este é um protótipo com dados mockados (sem backend). As respostas ficam salvas
-        apenas no seu navegador para demonstrar a experiência do teste.
+        MVP sem backend. Persistência em IndexedDB (nativa do navegador). Opcionalmente enviaremos para Google Sheets por webhook em fase posterior.
       </p>
     </div>
   </footer>
@@ -62,11 +65,15 @@ function Home() {
   const [parentName, setParentName] = useState(profileFromLS?.parentName || "");
   const [email, setEmail] = useState(profileFromLS?.email || "");
   const [childAge, setChildAge] = useState(profileFromLS?.childAge || "");
+  const [consent, setConsent] = useState(true);
 
   const startQuiz = () => {
-    const profile = { parentName, email, childAge };
+    if (!consent) {
+      toast({ title: "É preciso aceitar o uso de dados para continuar." });
+      return;
+    }
+    const profile = { parentName, email, childAge, consent: true };
     saveProfile(profile);
-    // reset current answers for a fresh start
     saveAnswers({});
     toast({ title: "Vamos começar!", description: "Seu perfil foi salvo." });
     navigate("/quiz");
@@ -97,8 +104,13 @@ function Home() {
               <Input id="age" type="number" min={2} max={15} placeholder="Ex.: 8" value={childAge} onChange={(e) => setChildAge(e.target.value)} />
             </div>
             <div className="sm:col-span-2">
-              <Label htmlFor="email">E-mail (opcional – para receber o resultado)</Label>
+              <Label htmlFor="email">E-mail (opcional – para ver histórico e receber materiais)</Label>
               <Input id="email" type="email" placeholder="voce@email.com" value={email} onChange={(e) => setEmail(e.target.value)} />
+            </div>
+            <div className="sm:col-span-2 flex items-center gap-2 text-sm text-slate-700">
+              <Checkbox id="consent" checked={consent} onCheckedChange={(v) => setConsent(Boolean(v))} />
+              <Label htmlFor="consent">Li e concordo com o uso dos meus dados para gerar meu resultado e histórico.</Label>
+              <Link to="/privacidade" className="ml-1 underline">Política de Privacidade (MVP)</Link>
             </div>
             <div className="sm:col-span-2 flex items-center gap-3">
               <Button onClick={startQuiz} className="bg-[#1D3557] hover:bg-[#173052]">Iniciar Teste</Button>
@@ -118,7 +130,6 @@ function Quiz() {
   const { toast } = useToast();
   const [answers, setAnswers] = useState(() => loadAnswers());
   const [index, setIndex] = useState(() => {
-    // resume last unanswered index
     const keys = QUESTIONS.map((q) => q.id);
     const firstUnanswered = keys.findIndex((k) => answers[k] === undefined);
     return firstUnanswered === -1 ? 0 : firstUnanswered;
@@ -145,10 +156,30 @@ function Quiz() {
     if (index > 0) setIndex((i) => i - 1);
   };
 
-  const finish = () => {
-    const payload = makeResultPayload(loadProfile(), answers);
-    saveResult(payload);
-    toast({ title: "Cálculo pronto!", description: "Gerando recomendações..." });
+  const finish = async () => {
+    const profile = loadProfile();
+    const payload = makeResultPayload(profile, answers);
+
+    // Build record for IndexedDB
+    const answersArray = QUESTIONS.map((qq) => Number(answers[qq.id] ?? 0));
+    const score = payload.result.total;
+    const level = payload.result.level;
+    const mapLevel = { Baixa: Enums.RISK.BAIXA, Moderada: Enums.RISK.MODERADA, Alta: Enums.RISK.ALTA, "Muito Alta": Enums.RISK.MUITO_ALTA };
+
+    const record = {
+      id: crypto.randomUUID(),
+      email: profile?.email || "",
+      responsavel_nome: profile?.parentName || "",
+      child_age: Number(profile?.childAge) || null,
+      answers: answersArray,
+      score_total: score,
+      risk_level: mapLevel[level],
+      created_at: new Date().toISOString(),
+      consent: Boolean(profile?.consent ?? true),
+    };
+
+    await addTest(record);
+    toast({ title: "Resultado salvo com sucesso" });
     navigate("/resultado");
   };
 
@@ -199,6 +230,9 @@ function Quiz() {
                 Anterior
               </Button>
               {index < QUESTIONS.length - 1 && (
+                <Button onClick={() => (canAdvance ? finishOrNext(false) : toast({ title: "Selecione uma opção" }))} className="hidden" />
+              )}
+              {index < QUESTIONS.length - 1 && (
                 <Button onClick={() => (canAdvance ? next() : toast({ title: "Selecione uma opção" }))} className="bg-[#1D3557] hover:bg-[#173052]">
                   Próxima
                 </Button>
@@ -224,19 +258,16 @@ function Resultado() {
   const [sending, setSending] = useState(false);
 
   const sendEmail = async () => {
-    if (!profile?.email) {
-      toast({ title: "Informe um e-mail na primeira tela (opcional)", description: "Volte à página inicial para adicionar." });
-      return;
-    }
     setSending(true);
     try {
-      await mockEmailOptIn(profile.email, makeResultPayload(profile, answers));
+      await mockEmailOptIn(profile?.email || "", makeResultPayload(profile, answers));
       toast({ title: "Enviamos uma cópia (simulado)", description: "Confira sua caixa de entrada." });
     } finally {
       setSending(false);
     }
   };
 
+  const copy = getCopy(summary.level);
   const levelColor = {
     Baixa: "text-green-700 bg-green-50",
     Moderada: "text-amber-700 bg-amber-50",
@@ -244,85 +275,84 @@ function Resultado() {
     "Muito Alta": "text-red-700 bg-red-50",
   }[summary.level];
 
+  const lastRecord = {
+    id: crypto.randomUUID(), // standalone export when navigating direto
+    email: profile?.email || "",
+    responsavel_nome: profile?.parentName || "",
+    child_age: Number(profile?.childAge) || null,
+    answers: QUESTIONS.map((qq) => Number(answers[qq.id] ?? 0)),
+    score_total: summary.total,
+    risk_level: copy.enumValue,
+    created_at: new Date().toISOString(),
+    consent: Boolean(profile?.consent ?? true),
+  };
+
   return (
     <Container>
       <section className="space-y-6">
         <Card>
           <CardHeader>
-            <CardTitle className="text-[#1D3557]">Seu Resultado</CardTitle>
+            <CardTitle className="text-[#1D3557]">Resultado do Teste: {copy.levelName}</CardTitle>
+            <p className="text-sm text-slate-600">Pontuação: {summary.total}/80 • Data: {new Date().toLocaleString()}</p>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-sm ${levelColor}`}>
-              <span className="font-semibold">{summary.category.name}</span>
+              <span className="font-semibold">{copy.levelName}</span>
               <span>•</span>
               <span>{summary.total} de {summary.max} pontos</span>
             </div>
-            <p className="text-slate-700">
-              Interpretação:
-              {summary.level === "Baixa" && " Há equilíbrio no uso de telas. Continue reforçando hábitos saudáveis."}
-              {summary.level === "Moderada" && " Alguns sinais pedem atenção. Ajustes consistentes podem evitar agravamento."}
-              {summary.level === "Alta" && " Há impacto significativo. É hora de intervir com medidas claras."}
-              {summary.level === "Muito Alta" && " Situação crítica – precisa de um plano intensivo e apoio."}
-            </p>
-
+            <p className="text-slate-700">{copy.message}</p>
             <div>
-              <h3 className="mb-2 font-semibold">Recomendações imediatas</h3>
+              <h3 className="mb-2 font-semibold">3 ações rápidas</h3>
               <ul className="list-disc space-y-1 pl-5 text-slate-700">
-                {summary.tips.map((t, i) => (
+                {copy.actions.map((t, i) => (
                   <li key={i}>{t}</li>
                 ))}
               </ul>
             </div>
 
-            <div className="flex flex-wrap gap-3 pt-4">
+            <p className="text-xs text-slate-500">Diretrizes indicam limites diários de tela por faixa etária. Ajuste a rotina com carinho e consistência.</p>
+
+            <div className="flex flex-wrap gap-3 pt-2">
               <a href={BRAND.courseUrl} target="_blank" rel="noreferrer">
-                <Button className="bg-[#FFD60A] text-black hover:bg-[#e6c009]">Quero Participar do Detox</Button>
+                <Button className="bg-[#FFD60A] text-black hover:bg-[#e6c009]">{copy.cta}</Button>
               </a>
               <Button variant="outline" onClick={sendEmail} disabled={sending}>
                 {sending ? "Enviando..." : "Enviar resultado por e-mail (simulado)"}
               </Button>
+              <Button variant="outline" onClick={() => exportPDF(lastRecord, { title: `Resultado do Teste: ${copy.levelName}`, subtitle: `Pontuação: ${summary.total}/80 • Data: ${new Date().toLocaleString()}`, levelName: copy.levelName, message: copy.message, actions: copy.actions, footer: "Diretrizes indicam limites diários de tela por faixa etária. Ajuste a rotina com carinho e consistência.", logoUrl: BRAND.logoUrl })}>Baixar PDF</Button>
+              <Button variant="outline" onClick={() => exportCSV(lastRecord)}>Baixar CSV</Button>
+              <Link to="/">
+                <Button variant="ghost">Refazer Teste</Button>
+              </Link>
             </div>
           </CardContent>
         </Card>
 
-        <History />
+        <RecentHistory />
       </section>
     </Container>
   );
 }
 
-function History() {
-  const [items, setItems] = useState(() => {
-    try {
-      return JSON.parse(localStorage.getItem("tddi_results_history_v1") || "[]");
-    } catch (e) {
-      return [];
-    }
-  });
+function RecentHistory() {
+  const [items, setItems] = useState([]);
   useEffect(() => {
-    const id = setInterval(() => {
-      try {
-        const next = JSON.parse(localStorage.getItem("tddi_results_history_v1") || "[]");
-        if (next.length !== items.length) setItems(next);
-      } catch {}
-    }, 800);
-    return () => clearInterval(id);
-  }, [items.length]);
-
+    listAllTests(10).then(setItems);
+  }, []);
   if (!items.length) return null;
-
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-[#1D3557]">Histórico (neste navegador)</CardTitle>
+        <CardTitle className="text-[#1D3557]">Histórico recente (neste dispositivo)</CardTitle>
       </CardHeader>
       <CardContent>
         <ul className="space-y-3">
           {items.map((it) => (
             <li key={it.id} className="flex items-center justify-between rounded-md border p-3">
               <div>
-                <p className="text-sm font-medium">{new Date(it.createdAt).toLocaleString()}</p>
-                <p className="text-xs text-slate-600">Nível: {it.result.level} • Pontos: {it.result.total}/{it.result.max}</p>
+                <p className="text-sm font-medium">{new Date(it.created_at).toLocaleString()}</p>
+                <p className="text-xs text-slate-600">Nível: {levelLabel(it.risk_level)} • Pontos: {it.score_total}/80</p>
               </div>
               <a href={BRAND.courseUrl} target="_blank" rel="noreferrer" className="text-sm text-[#1D3557] underline">
                 Conhecer o Curso
@@ -335,12 +365,115 @@ function History() {
   );
 }
 
+function MeusResultados() {
+  const [email, setEmail] = useState(loadProfile()?.email || "");
+  const [items, setItems] = useState([]);
+  const buscar = async () => {
+    const res = await listTestsByEmail(email.trim());
+    setItems(res);
+  };
+  useEffect(() => {
+    if (email) buscar();
+  }, []);
+
+  return (
+    <Container>
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-[#1D3557]">Meus Resultados</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex flex-col gap-3 sm:flex-row">
+            <Input placeholder="seu@email.com" value={email} onChange={(e) => setEmail(e.target.value)} />
+            <Button onClick={buscar} className="bg-[#1D3557] hover:bg-[#173052]">Buscar</Button>
+          </div>
+          {!email && (
+            <p className="text-sm text-slate-600">Para ver seu histórico neste dispositivo, informe o e-mail usado quando fez o teste.</p>
+          )}
+          <div className="space-y-3">
+            {items.map((it) => (
+              <Card key={it.id} className="border">
+                <CardContent className="p-4">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-medium">{new Date(it.created_at).toLocaleString()}</p>
+                      <p className="text-xs text-slate-600">Nível: {levelLabel(it.risk_level)} • Pontos: {it.score_total}/80</p>
+                    </div>
+                    <div className="flex gap-2">
+                      <Button variant="outline" onClick={() => exportCSV(it)}>CSV</Button>
+                      <Button variant="outline" onClick={() => exportPDF(it, copyFromEnum(it.risk_level))}>PDF</Button>
+                    </div>
+                  </div>
+                  <Accordion type="single" collapsible className="mt-3">
+                    <AccordionItem value="detalhes">
+                      <AccordionTrigger>Ver detalhes</AccordionTrigger>
+                      <AccordionContent>
+                        <p className="text-sm">Respostas: {JSON.stringify(it.answers)}</p>
+                      </AccordionContent>
+                    </AccordionItem>
+                  </Accordion>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+    </Container>
+  );
+}
+
+function Privacy() {
+  return (
+    <Container>
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-[#1D3557]">Política de Privacidade (MVP)</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3 text-sm text-slate-700">
+          <p>Usamos seus dados apenas para gerar o resultado do teste, exibir histórico neste dispositivo e melhorar a experiência. Não compartilhamos com terceiros.</p>
+          <p>Você pode solicitar remoção enviando um e-mail para nossa equipe (Fase 2). Como este MVP não tem backend, os dados ficam salvos no seu próprio navegador.</p>
+        </CardContent>
+      </Card>
+    </Container>
+  );
+}
+
+function getCopy(level) {
+  if (level === "Baixa") {
+    return { levelName: "Baixa", enumValue: Enums.RISK.BAIXA, message: "Boa notícia: os hábitos digitais do seu filho(a) estão sob controle. Mantenha as rotinas que já funcionam e reforce limites claros, combinados em família.", actions: ["Combine horários fixos de tela.", "Mantenha zonas sem tela (ex.: refeições).", "Incentive atividades offline (leitura, brincadeiras, ar livre)."], cta: "Conhecer o Detox Digital Infantil (prevenção e boas práticas)" };
+  }
+  if (level === "Moderada") {
+    return { levelName: "Moderada", enumValue: Enums.RISK.MODERADA, message: "Existem sinais de alerta. Pequenos ajustes agora evitam que o uso de telas avance para padrões problemáticos.", actions: ["Regras visíveis (quadro de horários).", "Rotina de desligar 1h antes de dormir.", "Ofereça alternativas quando pedir tela (jogo rápido, piada, mini-dança)."], cta: "Quero o Detox com plano simples de 7 dias" };
+  }
+  if (level === "Alta") {
+    return { levelName: "Alta", enumValue: Enums.RISK.ALTA, message: "O uso de telas já prejudica sono, estudos ou convivência. É hora de uma intervenção estruturada e consistente.", actions: ["Zonas e horários sem tela firmes (mesa, quarto à noite).", "Acordos com consequências previsíveis (sem gritos, sem barganha).", "Rotina diária de 30–60 min offline com você (brincar, construir algo, sair)."], cta: "Iniciar o Detox passo a passo (acompanhado)" };
+  }
+  return { levelName: "Muito Alta", enumValue: Enums.RISK.MUITO_ALTA, message: "Quadro severo de dependência digital. Você deu o passo certo buscando ajuda. Com método e constância, é reversível.", actions: ["Detox guiado (redução progressiva ou pausa breve com substituições).", "Retirar telas do quarto; regras de sono firmes.", "Conversas curtas e empáticas; foco em vínculos."], cta: "Preciso do Detox completo e suporte" };
+}
+
+function levelLabel(enumVal) {
+  return { BAIXA: "Baixa", MODERADA: "Moderada", ALTA: "Alta", MUITO_ALTA: "Muito Alta" }[enumVal] || "";
+}
+
+function copyFromEnum(enumVal) {
+  const map = {
+    BAIXA: getCopy("Baixa"),
+    MODERADA: getCopy("Moderada"),
+    ALTA: getCopy("Alta"),
+    MUITO_ALTA: getCopy("Muito Alta"),
+  };
+  const c = map[enumVal];
+  return { ...c, title: `Resultado do Teste: ${c.levelName}`, subtitle: "", levelName: c.levelName, logoUrl: BRAND.logoUrl };
+}
+
 export default function AppRoutes() {
   return (
     <Routes>
       <Route path="/" element={<Home />} />
       <Route path="/quiz" element={<Quiz />} />
       <Route path="/resultado" element={<Resultado />} />
+      <Route path="/meus-resultados" element={<MeusResultados />} />
+      <Route path="/privacidade" element={<Privacy />} />
     </Routes>
   );
 }
