@@ -21,7 +21,8 @@ import {
   makeResultPayload,
 } from "../mock/mock";
 import { addTest, listAllTests, listTestsByEmail, Enums } from "../lib/db";
-import { exportCSV, exportPDF } from "../lib/exporters";
+import { exportResultAsCSV, exportPDF } from "../lib/exporters";
+import { sendLeadToSheets } from "../lib/leads";
 
 const Container = ({ children }) => (
   <div className="min-h-screen bg-[hsl(var(--background))]">
@@ -52,7 +53,7 @@ const Footer = () => (
   <footer className="border-t bg-[#F1F1F1]">
     <div className="mx-auto w-full max-w-6xl px-4 py-6 text-xs text-slate-600">
       <p>
-        MVP sem backend. Persistência em IndexedDB (nativa do navegador). Opcionalmente enviaremos para Google Sheets por webhook em fase posterior.
+        MVP sem backend. Persistência em IndexedDB (nativa do navegador). Envio best-effort para Google Sheets via webhook.
       </p>
     </div>
   </footer>
@@ -64,20 +65,24 @@ function Home() {
   const profileFromLS = loadProfile();
   const [parentName, setParentName] = useState(profileFromLS?.parentName || "");
   const [email, setEmail] = useState(profileFromLS?.email || "");
+  const [phone, setPhone] = useState(profileFromLS?.phone || "");
   const [childAge, setChildAge] = useState(profileFromLS?.childAge || "");
-  const [consent, setConsent] = useState(true);
+  const [consentUse, setConsentUse] = useState(true); // consentimento para uso no teste (obrigatório)
+  const [consentContact, setConsentContact] = useState(true); // LGPD contato
 
   const startQuiz = () => {
-    if (!consent) {
+    if (!consentUse) {
       toast({ title: "É preciso aceitar o uso de dados para continuar." });
       return;
     }
-    const profile = { parentName, email, childAge, consent: true };
+    const profile = { parentName, email, phone, childAge, consent: consentContact };
     saveProfile(profile);
     saveAnswers({});
     toast({ title: "Vamos começar!", description: "Seu perfil foi salvo." });
     navigate("/quiz");
   };
+
+  const sanitizePhone = (v) => v.replace(/[^\d()+\-\s]/g, "");
 
   return (
     <Container>
@@ -104,13 +109,24 @@ function Home() {
               <Input id="age" type="number" min={2} max={15} placeholder="Ex.: 8" value={childAge} onChange={(e) => setChildAge(e.target.value)} />
             </div>
             <div className="sm:col-span-2">
-              <Label htmlFor="email">E-mail (opcional – para ver histórico e receber materiais)</Label>
+              <Label htmlFor="email">E-mail</Label>
               <Input id="email" type="email" placeholder="voce@email.com" value={email} onChange={(e) => setEmail(e.target.value)} />
+              <p className="mt-1 text-xs text-slate-500">Tornamos o e-mail obrigatório apenas para enviar seu resultado e orientações futuras. Seus dados não serão compartilhados com terceiros.</p>
             </div>
-            <div className="sm:col-span-2 flex items-center gap-2 text-sm text-slate-700">
-              <Checkbox id="consent" checked={consent} onCheckedChange={(v) => setConsent(Boolean(v))} />
-              <Label htmlFor="consent">Li e concordo com o uso dos meus dados para gerar meu resultado e histórico.</Label>
-              <Link to="/privacidade" className="ml-1 underline">Política de Privacidade (MVP)</Link>
+            <div className="sm:col-span-2">
+              <Label htmlFor="phone">Telefone (opcional)</Label>
+              <Input id="phone" type="tel" placeholder="(DDD) 9XXXX-XXXX" value={phone} onChange={(e) => setPhone(sanitizePhone(e.target.value))} />
+            </div>
+            <div className="sm:col-span-2 flex flex-col gap-2 text-sm text-slate-700">
+              <div className="flex items-center gap-2">
+                <Checkbox id="consentUse" checked={consentUse} onCheckedChange={(v) => setConsentUse(Boolean(v))} />
+                <Label htmlFor="consentUse">Li e concordo com o uso dos meus dados para gerar meu resultado e histórico.</Label>
+                <Link to="/privacidade" className="ml-1 underline">Política de Privacidade (MVP)</Link>
+              </div>
+              <div className="flex items-center gap-2">
+                <Checkbox id="consentContact" checked={consentContact} onCheckedChange={(v) => setConsentContact(Boolean(v))} />
+                <Label htmlFor="consentContact">Aceito receber orientações e materiais do Detox Digital Infantil no meu e-mail/WhatsApp.</Label>
+              </div>
             </div>
             <div className="sm:col-span-2 flex items-center gap-3">
               <Button onClick={startQuiz} className="bg-[#1D3557] hover:bg-[#173052]">Iniciar Teste</Button>
@@ -160,26 +176,53 @@ function Quiz() {
     const profile = loadProfile();
     const payload = makeResultPayload(profile, answers);
 
-    // Build record for IndexedDB
     const answersArray = QUESTIONS.map((qq) => Number(answers[qq.id] ?? 0));
     const score = payload.result.total;
     const level = payload.result.level;
     const mapLevel = { Baixa: Enums.RISK.BAIXA, Moderada: Enums.RISK.MODERADA, Alta: Enums.RISK.ALTA, "Muito Alta": Enums.RISK.MUITO_ALTA };
 
+    // Aviso se não houver e-mail
+    const email = (profile?.email || "").trim();
+    if (!email) {
+      toast({ title: "Para receber materiais e histórico por e-mail, preencha seu e-mail." });
+    }
+
     const record = {
       id: crypto.randomUUID(),
-      email: profile?.email || "",
+      email,
+      telefone: profile?.phone || "",
       responsavel_nome: profile?.parentName || "",
       child_age: Number(profile?.childAge) || null,
       answers: answersArray,
       score_total: score,
       risk_level: mapLevel[level],
       created_at: new Date().toISOString(),
-      consent: Boolean(profile?.consent ?? true),
+      consent: email ? Boolean(profile?.consent ?? true) : false,
     };
 
     await addTest(record);
-    toast({ title: "Resultado salvo com sucesso" });
+
+    // Best-effort webhook para Sheets
+    const leadPayload = {
+      nome: record.responsavel_nome,
+      telefone: record.telefone,
+      email: record.email,
+      child_age: record.child_age,
+      answers: record.answers,
+      score_total: record.score_total,
+      risk_level: record.risk_level,
+      consent: record.consent,
+      created_at: record.created_at,
+      user_agent: navigator.userAgent,
+    };
+    const ok = await sendLeadToSheets(leadPayload);
+
+    if (ok) {
+      toast({ title: "Dados enviados", description: "Você receberá novidades do Detox Digital Infantil." });
+    } else {
+      toast({ title: "Conexão instável", description: "Resultado salvo neste dispositivo. Tentaremos novamente mais tarde." });
+    }
+
     navigate("/resultado");
   };
 
@@ -230,9 +273,6 @@ function Quiz() {
                 Anterior
               </Button>
               {index < QUESTIONS.length - 1 && (
-                <Button onClick={() => (canAdvance ? finishOrNext(false) : toast({ title: "Selecione uma opção" }))} className="hidden" />
-              )}
-              {index < QUESTIONS.length - 1 && (
                 <Button onClick={() => (canAdvance ? next() : toast({ title: "Selecione uma opção" }))} className="bg-[#1D3557] hover:bg-[#173052]">
                   Próxima
                 </Button>
@@ -276,8 +316,9 @@ function Resultado() {
   }[summary.level];
 
   const lastRecord = {
-    id: crypto.randomUUID(), // standalone export when navigating direto
+    id: crypto.randomUUID(),
     email: profile?.email || "",
+    telefone: profile?.phone || "",
     responsavel_nome: profile?.parentName || "",
     child_age: Number(profile?.childAge) || null,
     answers: QUESTIONS.map((qq) => Number(answers[qq.id] ?? 0)),
@@ -321,7 +362,7 @@ function Resultado() {
                 {sending ? "Enviando..." : "Enviar resultado por e-mail (simulado)"}
               </Button>
               <Button variant="outline" onClick={() => exportPDF(lastRecord, { title: `Resultado do Teste: ${copy.levelName}`, subtitle: `Pontuação: ${summary.total}/80 • Data: ${new Date().toLocaleString()}`, levelName: copy.levelName, message: copy.message, actions: copy.actions, footer: "Diretrizes indicam limites diários de tela por faixa etária. Ajuste a rotina com carinho e consistência.", logoUrl: BRAND.logoUrl })}>Baixar PDF</Button>
-              <Button variant="outline" onClick={() => exportCSV(lastRecord)}>Baixar CSV</Button>
+              <Button variant="outline" onClick={() => exportResultAsCSV(lastRecord, "resultado.csv")}>Baixar CSV</Button>
               <Link to="/">
                 <Button variant="ghost">Refazer Teste</Button>
               </Link>
@@ -354,9 +395,10 @@ function RecentHistory() {
                 <p className="text-sm font-medium">{new Date(it.created_at).toLocaleString()}</p>
                 <p className="text-xs text-slate-600">Nível: {levelLabel(it.risk_level)} • Pontos: {it.score_total}/80</p>
               </div>
-              <a href={BRAND.courseUrl} target="_blank" rel="noreferrer" className="text-sm text-[#1D3557] underline">
-                Conhecer o Curso
-              </a>
+              <div className="flex gap-2">
+                <Button variant="outline" onClick={() => exportResultAsCSV(it, "resultado.csv")}>CSV</Button>
+                <Button variant="outline" onClick={() => exportPDF(it, copyFromEnum(it.risk_level))}>PDF</Button>
+              </div>
             </li>
           ))}
         </ul>
@@ -400,7 +442,7 @@ function MeusResultados() {
                       <p className="text-xs text-slate-600">Nível: {levelLabel(it.risk_level)} • Pontos: {it.score_total}/80</p>
                     </div>
                     <div className="flex gap-2">
-                      <Button variant="outline" onClick={() => exportCSV(it)}>CSV</Button>
+                      <Button variant="outline" onClick={() => exportResultAsCSV(it, "resultado.csv")}>CSV</Button>
                       <Button variant="outline" onClick={() => exportPDF(it, copyFromEnum(it.risk_level))}>PDF</Button>
                     </div>
                   </div>
@@ -431,7 +473,7 @@ function Privacy() {
         </CardHeader>
         <CardContent className="space-y-3 text-sm text-slate-700">
           <p>Usamos seus dados apenas para gerar o resultado do teste, exibir histórico neste dispositivo e melhorar a experiência. Não compartilhamos com terceiros.</p>
-          <p>Você pode solicitar remoção enviando um e-mail para nossa equipe (Fase 2). Como este MVP não tem backend, os dados ficam salvos no seu próprio navegador.</p>
+          <p>Você pode solicitar remoção enviando um e-mail para nossa equipe (Fase 2). Como este MVP não tem backend, os dados ficam salvos no seu próprio navegador e enviamos best-effort para o Google Sheets quando possível.</p>
         </CardContent>
       </Card>
     </Container>

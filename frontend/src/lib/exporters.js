@@ -1,43 +1,51 @@
 import { jsPDF } from "jspdf";
 
-export function exportCSV(record) {
+function toCSVRow(values) {
+  return values
+    .map((v) => {
+      if (v === null || v === undefined) v = "";
+      const s = String(v).replace(/"/g, '""');
+      return `"${s}"`;
+    })
+    .join(",");
+}
+
+export function exportResultAsCSV(result, filename = "resultado.csv") {
   const headers = [
-    "id",
-    "email",
+    "timestamp",
     "responsavel_nome",
+    "telefone",
+    "email",
     "child_age",
-    "answers_json",
     "score_total",
     "risk_level",
-    "created_at",
-    "consent",
+    "answers_json",
   ];
   const row = [
-    record.id,
-    record.email || "",
-    record.responsavel_nome || "",
-    record.child_age ?? "",
-    JSON.stringify(record.answers),
-    record.score_total,
-    record.risk_level,
-    record.created_at,
-    String(record.consent),
+    result.created_at || new Date().toISOString(),
+    result.responsavel_nome || "",
+    result.telefone || "",
+    result.email || "",
+    result.child_age ?? "",
+    result.score_total ?? "",
+    result.risk_level || "",
+    JSON.stringify(result.answers || []),
   ];
-  const csv = `${headers.join(",")}\n${row.map(safeCSV).join(",")}`;
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+
+  const lines = [];
+  lines.push(toCSVRow(headers));
+  lines.push(toCSVRow(row));
+
+  const csvString = "\uFEFF" + lines.join("\r\n") + "\r\n"; // BOM + CRLF
+  const blob = new Blob([csvString], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `resultado_${record.id}.csv`;
+  a.download = filename;
+  document.body.appendChild(a);
   a.click();
+  document.body.removeChild(a);
   URL.revokeObjectURL(url);
-}
-
-function safeCSV(v) {
-  if (v == null) return "";
-  const str = String(v).replaceAll('"', '""');
-  if (str.includes(",") || str.includes("\n")) return `"${str}"`;
-  return str;
 }
 
 export async function exportPDF(record, copy) {
@@ -45,7 +53,6 @@ export async function exportPDF(record, copy) {
   const margin = 48;
   let y = margin;
 
-  // Try to add logo if present
   try {
     if (copy.logoUrl) {
       const img = await fetch(copy.logoUrl).then((r) => r.blob());
@@ -61,9 +68,9 @@ export async function exportPDF(record, copy) {
   doc.setFontSize(11);
   doc.text(copy.subtitle || "", margin, (y += 36));
 
-  // Info block
   const lines = [
     `Responsável: ${record.responsavel_nome || "-"}`,
+    `Telefone: ${record.telefone || "-"}`,
     `E-mail: ${record.email || "-"}`,
     `Idade da criança: ${record.child_age ?? "-"}`,
     `Nível: ${copy.levelName} | Pontuação: ${record.score_total}/80` ,
@@ -73,7 +80,6 @@ export async function exportPDF(record, copy) {
     doc.text(l, margin, (y += 20));
   });
 
-  // Recommendations
   doc.setFont("helvetica", "bold");
   doc.text("Recomendações", margin, (y += 28));
   doc.setFont("helvetica", "normal");
@@ -82,7 +88,6 @@ export async function exportPDF(record, copy) {
     y = addWrappedText(doc, `• ${t}`, margin, y + 16, 520);
   });
 
-  // footer note
   y = addWrappedText(doc, copy.footer || "", margin, y + 20, 520);
 
   doc.save(`resultado_${record.id}.pdf`);
